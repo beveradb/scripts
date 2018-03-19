@@ -1,0 +1,14 @@
+#!/bin/sh
+
+if [ $# -ne 1 ]; then
+    echo Usage: fetch-url-response URL
+    exit 1
+fi
+
+URL=$1
+
+RESULT="$(curl "$URL" -L -s -o /dev/null -w "%{http_code} %{time_total}")"
+RESPONSECODE="$(echo "${RESULT}" | cut -f1 -d' ')"
+RESPONSETIME="$(echo "${RESULT}" | cut -f2 -d' ' | xargs printf "%.*f\\n" 1 )"
+
+echo "${RESPONSECODE} (${RESPONSETIME}s)"

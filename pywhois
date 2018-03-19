@@ -1,0 +1,32 @@
+#!/bin/python
+import sys
+import whois
+import datetime
+
+try:
+    whoisResults = whois.whois(sys.argv[1])
+
+    # Print each parsed WHOIS result key/value pair as simple space-separated values,
+    # after applying some additional pre-formatting and cleanup rules
+    for whoisResultKey, whoisResultValue in whoisResults.items():
+        
+        # If value is a list, it's likely either:
+        # - A date range (e.g. domain registration date), in which case all we want is the formatted date
+        # - Multiple values, in which case we want only unique values and for these to be consistently cased and split with space
+        if isinstance(whoisResultValue, (list,)):
+
+            # If the first element in this list is a date, assume this is a date range and blindly accept the first date
+            # We'll format the date further down this code
+            if isinstance(whoisResultValue[0],datetime.datetime):
+                whoisResultValue = whoisResultValue[0]
+            else:
+                whoisResultValue = set(map(str.lower,whoisResultValue))
+                whoisResultValue = ' '.join(sorted(whoisResultValue))
+        
+        # Format all date values to only output the date (no time), in ISO8601 format
+        if isinstance(whoisResultValue,datetime.datetime):
+            whoisResultValue = whoisResultValue.strftime('%Y-%m-%d')
+
+        print(whoisResultKey, whoisResultValue)
+except:
+    print("WHOIS lookup failed. Try GNU whois instead.")

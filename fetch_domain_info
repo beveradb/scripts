@@ -1,0 +1,220 @@
+#!/bin/bash
+
+####################################################################################################################################################
+# fetch_domain_info
+# Fetch owner, registration, and hosting-related info about a domain name
+# If anything is broken or any changes are required, please contact andrew@beveridge.uk.
+####################################################################################################################################################
+
+# Add script filename to variable for use in usage statement etc.
+thisScriptFilename="$(basename "$0")"
+
+# Option -c: [Optional] CSV mode, output in CSV format rather than easy-to-read key/value pairs.
+csvMode=''
+
+# Option -d: [Optional] Single domain mode. Requires domain name to look up info for.
+singleDomainMode=''
+
+# Option -b: [Optional] Bulk mode, changes usage to accept path to file containing one line per domain to process.
+bulkModeDomainFile=''
+
+# Option -h: Show this help / usage message to user.
+usage () {
+   cat <<EOF
+   
+Usage: ${thisScriptFilename} [-c] [-d domain] [-b domainfile]
+
+   -c   [Optional] CSV mode. Outputs header row, then one comma-separated value row per domain.
+   -d   [Optional] Single domain mode. Requires domain name to look up info for.
+   -b   [Optional] Bulk mode. Requires path to file containing one line per domain to process.
+   -h   Show this help / usage message to user.
+   
+Example: ${thisScriptFilename} -c -b domainlist.txt
+   
+EOF
+}
+
+# Parse simple parameters into descriptive variables, perform basic argument validation
+while getopts :c:d:b:h option
+do
+    case ${option} in
+        c) csvMode=1;;
+        d) singleDomainMode=$OPTARG;;
+        b) bulkModeDomainFile=$OPTARG;;
+        h) usage; exit;;
+        \?) echo "Unknown option: -$OPTARG" >&2; exit 1;;
+        :) echo "Missing option argument for -$OPTARG" >&2; exit 1;;
+        *) echo "Unimplemented option: -$OPTARG" >&2; exit 1;;
+    esac
+done
+
+# Ensure at least one of the mode options was provided
+if [ -z "${singleDomainMode}" ] && [ -z "${bulkModeDomainFile}" ] ; then
+    
+    # Print specific error and usage message to give user an example
+    echo "Error: At least one mode option must be specified (-d, -b)."
+    usage    
+    
+    # Exit with code 1 to signify an error occurred
+    exit 1
+fi
+
+function request_domain_info
+{
+    # Previous version of this script only used GNU whois directly, but parsing this is difficult once you start looking at multiple TLDs
+    # As such, it now uses a small python script using pywhois (https://bitbucket.org/richardpenman/pywhois), 
+    # an active project with regularly updated WHOIS parsing rules, to extract somewhat-consistent WHOIS data.
+    # Unfortunately even this isn't perfect and some less-popular TLDs (e.g. .scot) don't return results, 
+    # so we still fall back to various patterns again GNU whois results too.
+
+    DOMAIN=$1
+    GNUWHOISRESULT="$(whois "${DOMAIN}")"
+    PYWHOISRESULT="$(pywhois "${DOMAIN}")"
+
+    DOMAINREGISTRANT="$(echo "${PYWHOISRESULT}" | grep -oP '^registrant \K(.*)')"
+
+    if [ "${DOMAINREGISTRANT}" == "None" ]; then
+        DOMAINREGISTRANT=''
+    fi
+
+    if [ -z "${DOMAINREGISTRANT}" ]; then
+        DOMAINREGISTRANT="$(echo "${PYWHOISRESULT}" | grep -oP '^registrant_name \K(.*)')"
+    fi
+
+    if [ -z "${DOMAINREGISTRANT}" ]; then
+        DOMAINREGISTRANT="$(echo "${PYWHOISRESULT}" | grep -oP '^name \K(.*)')"
+    fi
+
+    if [ -z "${DOMAINREGISTRANT}" ]; then
+        DOMAINREGISTRANT="$(echo "${GNUWHOISRESULT}" | grep -ioP '^Registrant Name: \K(.*)' )"
+    fi
+
+    if [ -z "${DOMAINREGISTRANT}" ]; then
+        DOMAINREGISTRANT="$(echo "${GNUWHOISRESULT}" | grep -ioP '^Registrant: \K(.*)' )"
+    fi
+
+    if [ -z "${DOMAINREGISTRANT}" ]; then
+        DOMAINREGISTRANT="$(echo "${GNUWHOISRESULT}" | grep -A1 'Registrant:' | tail -1 | sed 's/Name: //' | trim)"
+    fi
+    
+    DOMAINREGISTRAR="$(echo "${PYWHOISRESULT}" | grep -oP '^registrar \K(.*)')"
+
+    if [ "${DOMAINREGISTRAR}" == "None" ]; then
+        DOMAINREGISTRAR=''
+    fi
+
+    if [ -z "${DOMAINREGISTRAR}" ]; then
+        DOMAINREGISTRAR="$(echo "${GNUWHOISRESULT}" | grep -ioP '^Registrar Name: \K(.*)' )"
+    fi
+
+    if [ -z "${DOMAINREGISTRAR}" ]; then
+        DOMAINREGISTRAR="$(echo "${GNUWHOISRESULT}" | grep -ioP '^Registrar: \K(.*)' )"
+    fi
+
+    if [ -z "${DOMAINREGISTRAR}" ]; then
+        DOMAINREGISTRAR="$(echo "${GNUWHOISRESULT}" | grep -A1 'Registrar:' | tail -1 | sed 's/Name: //' | trim)"
+    fi
+
+    DOMAINREGISTRATIONDATE="$(echo "${PYWHOISRESULT}" | grep -oP '^creation_date \K(.*)')"
+
+    if [ "${DOMAINREGISTRATIONDATE}" == "None" ]; then
+        DOMAINREGISTRATIONDATE=''
+    fi
+
+    if [ -z "${DOMAINREGISTRATIONDATE}" ]; then
+        DOMAINREGISTRATIONDATE="$(echo "${GNUWHOISRESULT}" | grep -ioP '^Creation Date: \K(.*)' | cut -c1-10 )"
+    fi
+
+    if [ -z "${DOMAINREGISTRATIONDATE}" ]; then
+        DOMAINREGISTRATIONDATE="$(echo "${GNUWHOISRESULT}" | grep -ioP '^Created: \K(.*)' | cut -c1-10 )"
+    fi
+
+    if [ -z "${DOMAINREGISTRATIONDATE}" ]; then
+        DOMAINREGISTRATIONDATE="$(echo "${GNUWHOISRESULT}" | grep -ioP '^Registered On: \K(.*)' | cut -c1-10 )"
+    fi
+
+    if [ -z "${DOMAINREGISTRATIONDATE}" ]; then
+        DOMAINREGISTRATIONDATE="$(echo "${GNUWHOISRESULT}" | grep -ioP '^Registered: \K(.*)' | cut -c1-10 )"
+    fi
+
+    DOMAINEXPIRYDATE="$(echo "${PYWHOISRESULT}" | grep -oP '^expiration_date \K(.*)')"
+
+    if [ "${DOMAINEXPIRYDATE}" == "None" ]; then
+        DOMAINEXPIRYDATE=''
+    fi
+
+    if [ -z "${DOMAINEXPIRYDATE}" ]; then
+        DOMAINEXPIRYDATE="$(echo "${GNUWHOISRESULT}" | grep -ioP '^Registry Expiry Date: \K(.*)' | cut -c1-10 )"
+    fi
+
+    if [ -z "${DOMAINEXPIRYDATE}" ]; then
+        DOMAINEXPIRYDATE="$(echo "${GNUWHOISRESULT}" | grep -ioP '^Expiry Date: \K(.*)' | cut -c1-10 )"
+    fi
+
+    if [ -z "${DOMAINEXPIRYDATE}" ]; then
+        DOMAINEXPIRYDATE="$(echo "${GNUWHOISRESULT}" | grep -ioP '^Expiry: \K(.*)' | cut -c1-10 )"
+    fi
+
+    if [ -z "${DOMAINEXPIRYDATE}" ]; then
+        DOMAINEXPIRYDATE="$(echo "${GNUWHOISRESULT}" | grep -ioP '^Expires: \K(.*)' | cut -c1-10 )"
+    fi
+
+    NAMESERVERS="$(echo "${PYWHOISRESULT}" | grep -oP '^name_servers \K(.*)')"
+
+    if [ "${NAMESERVERS}" == "None" ]; then
+        NAMESERVERS=''
+    fi
+
+    if [ -z "${NAMESERVERS}" ]; then
+        NAMESERVERS="$(echo "${GNUWHOISRESULT}" | grep -ioP '^Name Server: \K(.*)' | tr '\n' ' ' )"
+    fi
+
+    if [ -z "${NAMESERVERS}" ]; then
+        NAMESERVERS="$(echo "${GNUWHOISRESULT}" | tr '\n' '~' | grep -oP 'Name servers:~\K(.+?)~~' | tr -d '~' | trim)"
+    fi
+
+    PRIMARYIP="$(host -4 -t A "${DOMAIN}" | head -1 | grep -oP 'has address \K(.+)')"
+    IPWHOISRESULT="$(whois "${PRIMARYIP}")"
+    IPNETNAME="$(echo "${IPWHOISRESULT}" | grep -i 'NetName:' | trim | sed -n -e 's/NetName: //pi')"
+
+    HTTPRESPONSE="$(curl "$DOMAIN" -L -s -o /dev/null -w "%{http_code} %{time_total}")"
+    HTTPRESPONSECODE="$(echo "${HTTPRESPONSE}" | cut -f1 -d' ')"
+    HTTPRESPONSETIME="$(echo "${HTTPRESPONSE}" | cut -f2 -d' ' | xargs printf "%.*f\\n" 1 )"
+
+    print_domain_info
+}
+
+function print_domain_info
+{
+    if [ ! -z "${csvMode}" ]; then
+        echo "\"${DOMAIN}\",\"${DOMAINREGISTRANT}\",\"${DOMAINREGISTRAR}\",\"${DOMAINREGISTRATIONDATE}\",\"${DOMAINEXPIRYDATE}\",\"${NAMESERVERS}\",\"${PRIMARYIP}\",\"${IPNETNAME}\",\"${HTTPRESPONSECODE}\",\"${HTTPRESPONSETIME}\"";
+    else
+        printf "%-30s %-50s\\n" "Domain Name:" "${DOMAIN}"
+        printf "%-30s %-50s\\n" "Domain Registrant:" "${DOMAINREGISTRANT}"
+        printf "%-30s %-50s\\n" "Domain Registrar:" "${DOMAINREGISTRAR}"
+        printf "%-30s %-50s\\n" "Domain Registration Date:" "${DOMAINREGISTRATIONDATE}"
+        printf "%-30s %-50s\\n" "Domain Expiry Date:" "${DOMAINEXPIRYDATE}"
+        printf "%-30s %-50s\\n" "Domain Nameservers:" "${NAMESERVERS}"
+        printf "%-30s %-50s\\n" "Primary IP:" "${PRIMARYIP}"
+        printf "%-30s %-50s\\n" "Primary IP Network Name:" "${IPNETNAME}"
+        printf "%-30s %-50s\\n" "HTTP Response Code:" "${HTTPRESPONSECODE}"
+        printf "%-30s %-50s\\n" "HTTP Response Time:" "${HTTPRESPONSETIME}"
+    fi
+}
+
+if [ ! -z "${csvMode}" ]; then
+    echo "\"Domain Name\",\"Domain Registrant\",\"Domain Registrar\",\"Domain Registration Date\",\"Domain Expiry Date\",\"Nameservers\",\"Primary IP\",\"IP Network Name\",\"HTTP Response Code\",\"HTTP Response Time\"";
+fi
+
+if [ ! -z "${singleDomainMode}" ]; then
+    request_domain_info "${singleDomainMode}"
+else
+    if [ -r "${bulkModeDomainFile}" ]
+    then
+        while read -r DOMAIN; do
+            request_domain_info "${DOMAIN}"
+        done < "${bulkModeDomainFile}"
+    else
+        echo "File '${bulkModeDomainFile}' is not readable."
+    fi
+fi

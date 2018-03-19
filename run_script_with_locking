@@ -1,0 +1,382 @@
+#!/bin/bash
+
+####################################################################################################################################################
+# run_script_with_locking
+# Runs a script in a background thread, using lock directory to ensure only one instance of this script runs at any point, 
+# with any critical errors reported via email/SMS to technical contact(s).
+# This should be the standard wrapper used by all scripts which need to run regularly with locking.
+# If anything is broken or any changes are required, please discuss with andrew@beveridge.uk first.
+####################################################################################################################################################
+
+# Add wrapper script filename and PID to variables for use in error reporting, lock file path etc.
+thisWrapperScriptFilename=$(basename $0)
+thisWrapperScriptInstancePID=$$
+
+# Option -n: Human-friendly, unique name of this script. This should be descriptive as it will be used in error email/SMS messages, and unique across all scripts to avoid lock files clashing.
+scriptUniqueHumanName=""
+
+# Option -d: Absolute file path to run the script/command from.
+absolutePathToRunFrom=""
+
+# Option -r: The script or command to run.
+commandToRun=""
+
+# Option -l: [Optional] Absolute path to directory to create daily log file in. Defaults to directory named "logs" within the working path.
+logFileDirectory=""
+
+# Option -s: [Optional] Mobile phone recipient (or multiple if space separated) to send SMS with technical details to if any critical error occurs.
+technicalErrorSMSRecipients=""
+
+# Option -e: [Optional] Email recipient (or multiple if space separated) to send email with technical details to if any critical error occurs.
+technicalErrorEmailRecipients=""
+
+# Option -t: [Optional] Maximum allowed run time / lock file age (in minutes), default 1 hour.
+maxScriptRunTimeMinutes=60
+
+# Option -g: [Optional] Minimum time between sending email/SMS messages about critical error(s) (in minutes), default 1 hour.
+gapBetweenCriticalErrorMessagesMinutes=60
+
+# Option -h: Show this help / usage message to user.
+usage () {
+   cat <<EOF
+   
+Usage: ${thisWrapperScriptFilename} -n 'Unique Human Name' -d '/absolute/path/to/run/from' -r '/usr/bin/commandToRun withParameters' [-s] [-e] [-t] [-g] [-h]
+
+   -n   Human-friendly, unique name of this script. This should be descriptive as it will be used in error email/SMS messages, and unique across all scripts to avoid lock files clashing.
+   -d   Absolute file path to run the script/command from.
+   -r   The script or command to run.
+   -l   [Optional] Absolute path to directory to create daily log file in. Defaults to directory named "logs" within the working path.
+   -s   [Optional] Mobile phone recipient (or multiple if space separated) to send SMS with technical details to if any critical error occurs.
+   -e   [Optional] Email recipient (or multiple if space separated) to send email with technical details to if any critical error occurs.
+   -t   [Optional] Maximum allowed run time / lock file age (in minutes), default 1 hour.
+   -g   [Optional] Minimum time between sending email/SMS messages about critical error(s) (in minutes), default 1 hour.
+   -h   Show this help / usage message to user.
+   
+Example: ${thisWrapperScriptFilename} -n 'Customer/X Specific (Thing) Integration' -d '/home/customerx' -r '/usr/bin/php bin/specific_thing.php' -s '07835171222 07123456789' -e 'usupport@valleyt.co.uk jane.doe@customerx.com' -t 120
+   
+EOF
+}
+
+# Parse simple parameters into descriptive variables, perform basic argument validation
+while getopts :n:d:r:l:s:e:t:g:h option
+do
+    case ${option} in
+        n) scriptUniqueHumanName=$OPTARG;;
+        d) absolutePathToRunFrom=$OPTARG;;
+        r) commandToRun=$OPTARG;;
+        l) logFileDirectory=$OPTARG;;
+        s) technicalErrorSMSRecipients=$OPTARG;;
+        e) technicalErrorEmailRecipients=$OPTARG;;
+        t) maxScriptRunTimeMinutes=$OPTARG;;
+        g) gapBetweenCriticalErrorMessagesMinutes=$OPTARG;;
+        h) usage; exit;;
+        \?) echo "Unknown option: -$OPTARG" >&2; exit 1;;
+        :) echo "Missing option argument for -$OPTARG" >&2; exit 1;;
+        *) echo "Unimplemented option: -$OPTARG" >&2; exit 1;;
+    esac
+done
+
+# Ensure all mandatory options were provided
+if [ -z "${scriptUniqueHumanName}" ] || [ -z "${absolutePathToRunFrom}" ] || [ -z "${commandToRun}" ] ; then
+    
+    # Print specific error and usage message to give user an example
+    echo "Error: Value not provided for all mandatory options (-n, -d, -r)."
+    usage    
+    
+    # Exit with code 1 to signify an error occurred
+    exit 1
+fi
+
+# Turn human readable unique script name into alphanumeric slug for filepath and logging 
+scriptUniqueAlphanumericName="${scriptUniqueHumanName//[![:alnum:]]}"
+
+# Get date/time for use in error reporting to ensure timestamps are consistent
+wrapperScriptStartUnixtime=`date "+%s"`
+wrapperScriptStartDateTimeISO8601=`date "+%F %T.%6N"`
+todayDateYMD=`date "+%Y%m%d"`
+
+# Define file path to lock directory used to determine whether this script should run at all 
+thisWrapperScriptLockDirectory="/run/lock/${scriptUniqueAlphanumericName}"
+thisWrapperScriptInstanceLockFile="/run/lock/${scriptUniqueAlphanumericName}/${thisWrapperScriptInstancePID}.lock"
+
+# Define file path to store temporary log file containing any critical errors which have occurred since the last critical error message was sent
+lastCriticalErrorSent="/run/lock/${scriptUniqueAlphanumericName}.lastCriticalErrorSent"
+criticalErrorsLogFile="/run/lock/${scriptUniqueAlphanumericName}.criticalErrors.log"
+
+# Write SMS messages about critical errors to the spool directory to be picked up by cron job and sent via esendex API
+smsWaitingDir="/var/spool/sms/waiting"
+
+# Create a tmp file to write errors to.
+temporaryErrorFile=$(mktemp -p "/tmp/" ${scriptUniqueAlphanumericName}_${thisWrapperScriptFilename}_XXXXXX)
+
+# Default log file directory to folder named "logs" in working directory if not set
+if [ -z "${logFileDirectory}" ]; then
+    logFileDirectory="${absolutePathToRunFrom}/logs"
+fi
+
+# Create log file directory if it doesn't already exist
+if [ ! -d ${logFileDirectory} ]; then
+  mkdir -p ${logFileDirectory};
+fi
+
+# Create debug log file for today's date to write log messages to about this wrapper script's execution
+debugLogFile="${logFileDirectory}/${todayDateYMD}_${scriptUniqueAlphanumericName}_${thisWrapperScriptFilename}.log"
+touch ${debugLogFile}
+
+# Trap all common exit signals to give us somewhere to decide whether to clean up our lock file
+
+# If the script is interrupted by anything external it should pass 'interrupt' into trapExit, 
+# otherwise 'exit' if the script simply exits normally or deliberately
+
+# As per 'help trap' in Bash:
+#   'If a SIGNAL_SPEC is EXIT (0) ARG is executed on exit from the shell.'
+#   'Signal names are case insensitive and the SIG prefix is optional.'
+#  1) SIGHUP       2) SIGINT       3) SIGQUIT      4) SIGILL       5) SIGTRAP
+#  6) SIGABRT      7) SIGBUS       8) SIGFPE       9) SIGKILL     10) SIGUSR1
+# 11) SIGSEGV     12) SIGUSR2     13) SIGPIPE     14) SIGALRM     15) SIGTERM
+trap "trapExit exit" EXIT # EXIT = 0
+# We consider all other signals an interrupt of some sort; we still want to catch and clean up
+trap "trapExit interrupt" HUP INT QUIT ILL TRAP ABRT BUS FPE USR1 SEGV USR2 PIPE ALRM TERM
+
+function trapExit
+{
+    # Capture exit code before running any other commands
+    exitCode=$?
+    
+    # Signal type should be first parameter to trapExit; either 'exit' or 'interrupt', representing whether this exit was deliberate
+    signalType=$1
+    
+    logDebug "trapExit caught exit with signalType '${signalType}' and exitCode ${exitCode}"
+    
+    if [ "${signalType}" == "interrupt" ]
+    then
+        logDebug "Interrupt caught, killing child process if exists"
+        
+        if [ ! -z "${backgroundScriptPID}" ]
+        then
+            logDebug "Child process exists with PID ${backgroundScriptPID}, killing prematurely"
+            kill ${backgroundScriptPID}
+        fi
+        
+    else
+        logDebug "Normal exit caught, resetting trapped signals and clearing temporary files"
+        
+        # Untrap all trapped exit signals to avoid triggering trapExit multiple times
+        trap - EXIT HUP INT QUIT ILL TRAP ABRT BUS FPE USR1 SEGV USR2 PIPE ALRM TERM
+        
+        cleanupTemporaryFiles
+    fi
+}
+
+# Clean up any tmp files and directories if they exist.
+function cleanupTemporaryFiles
+{
+    # Delete temporary error file
+    logDebug "cleanupTemporaryFiles deleting temporary error file ${temporaryErrorFile}"
+    rm -f ${temporaryErrorFile}
+
+    # Delete lock file for this wrapper script
+    logDebug "cleanupTemporaryFiles deleting wrapper instance lock file ${thisWrapperScriptInstanceLockFile}"
+    rm -f ${thisWrapperScriptInstanceLockFile}
+    
+    # Delete lock directory for this unique script name, allowing it to run again 
+    logDebug "cleanupTemporaryFiles deleting wrapper lock directory ${thisWrapperScriptLockDirectory}"
+    rmdir --ignore-fail-on-non-empty ${thisWrapperScriptLockDirectory}
+    
+    logDebug "cleanup complete\n" 
+}
+
+# Log first argument as debug to ${debugFile}.
+function logDebug
+{
+    # Get CURRENT date/time string to add to log entries, rather than reusing the wrapperScriptStart variables defined at the top of script
+    nowDateTimeISO8601=`date "+%F %T.%6N"`
+    
+    # Only attempt to log if logfile exists, to avoid cluttering cron messages in syslog
+    if [ -e "${debugLogFile}" ]
+    then
+        echo -e "$nowDateTimeISO8601 [PID: ${thisWrapperScriptInstancePID}] $1" >> "${debugLogFile}"
+    fi
+}
+
+# Email technical error recipient(s) and exit if we were unable to create temporary files
+if [[ ! (-e ${debugLogFile} && -e ${temporaryErrorFile}) ]]; then
+
+    for technicalErrorEmailRecipient in ${technicalErrorEmailRecipients}
+    do
+        echo -e "Unable to create necessary temporary files: \n\ndebugLogFile: ${debugLogFile}\ntemporaryErrorFile: ${temporaryErrorFile}\n" | mail -s "${scriptUniqueHumanName} Temporary File Error [${thisWrapperScriptInstancePID}]" "${technicalErrorEmailRecipient}"
+    done
+    
+    # Exit with code 1 to signify an error occurred; cleanupTemporaryFiles should now run but will likely do nothing as no lock file has been created yet
+    exit 1
+fi
+
+# Add some initial useful info about the currently running wrapper script to the debug log
+echo -e "\n" >> ${debugLogFile}
+logDebug "Script: ${scriptUniqueAlphanumericName} $0"
+logDebug "Human Name: ${scriptUniqueHumanName} $0"
+logDebug "Host:   $(hostname)"
+logDebug "User:   $(whoami)"
+logDebug "PID:    ${thisWrapperScriptInstancePID}"
+
+# A critical error occurred. 
+# Send email and SMS notifications (max 1 per gap time length configured above) with error text;
+# clean up any temporary files (including wrapper instance lock file), and exit gracefully.
+function reportCriticalErrorAndExit
+{
+    logDebug "reportCriticalErrorAndExit called"
+    
+    # Get CURRENT date/time for use when identifying timeSinceLastCritical, rather than reusing the wrapperScriptStart variables defined at the top of script
+    nowUnixtime=`date "+%s"`
+    nowDateTimeISO8601=`date "+%F %T.%6N"`
+    
+    # Read temporaryErrorFile into variable and log contents to debug log if there are any
+    temporaryErrorFileContents=$(<${temporaryErrorFile})
+    
+    if [ ! -z "${temporaryErrorFileContents}" ]
+    then
+        logDebug "temporaryErrorFileContents: ${temporaryErrorFileContents}"
+    fi
+    
+    # Check that the criticalErrorsLogFile either doesn't exist (first error from this script ever) or is older than configured gap time    
+    lastCriticalErrorMessageSentTimestamp=`stat -c "%Y" ${lastCriticalErrorSent} 2>/dev/null`
+    lastCriticalErrorMessageSentTimestamp=${lastCriticalErrorMessageSentTimestamp:=0}
+    timeSinceLastCriticalErrorSentSeconds=$(( ${nowUnixtime} - ${lastCriticalErrorMessageSentTimestamp} ))
+    timeSinceLastCriticalErrorSentMinutes=$(( ${timeSinceLastCriticalErrorSentSeconds} / 60 ))
+    
+    if [ ! -f ${lastCriticalErrorSent} ] || [ ${timeSinceLastCriticalErrorSentMinutes} -gt ${gapBetweenCriticalErrorMessagesMinutes} ]
+    then
+        logDebug "lastCriticalErrorSent did not exist, or timeSinceLastCriticalErrorSentMinutes (${timeSinceLastCriticalErrorSentMinutes}) was older than configured maximum (${gapBetweenCriticalErrorMessagesMinutes} minutes), proceeding to send email and SMS"
+    
+        # Append most recent error to criticalErrorsLogFile
+        echo -e "${temporaryErrorFileContents}\n" >> ${criticalErrorsLogFile}
+        
+        # Send email with technical error details to technical AND customer contact(s)
+        for errorEmailRecipient in "${technicalErrorEmailRecipients}"
+        do
+            echo -e "An error occurred in script '${scriptUniqueAlphanumericName}' at $nowDateTimeISO8601\n\nTechnical error details below:\n" | cat - ${criticalErrorsLogFile} | mail -s "${scriptUniqueHumanName} Error [${thisWrapperScriptInstancePID}]" "${errorEmailRecipient}"
+        done
+        
+        # Send SMS text with technical error details to technical contact(s)
+        for errorSMSRecipient in ${technicalErrorSMSRecipients}
+        do
+            uniqueID=$(cat /proc/sys/kernel/random/uuid)
+            smsFilePath="${smsWaitingDir}/${scriptUniqueAlphanumericName}.${errorSMSRecipient}.${uniqueID}.sms"
+            
+            logDebug "Writing error SMS message to file path: ${smsFilePath}"
+            # Pipe the output through head to limit to 500 bytes, or roughly 3 SMS message credits to avoid costly texts if lots of errors have been generated
+            echo -e "${errorSMSRecipient}\n${scriptUniqueHumanName} Error (trimmed): \n" | cat - ${criticalErrorsLogFile} | head -c 500 > "${smsFilePath}"
+        done
+        
+        logDebug "Clearing criticalErrorsLogFile (${criticalErrorsLogFile}) and writing to ${lastCriticalErrorSent} as errors have been sent to recipients"
+        echo "" > ${criticalErrorsLogFile}
+        echo "Critical error details sent at ${nowDateTimeISO8601} to emails: '${technicalErrorEmailRecipients}' and mobiles: '${technicalErrorSMSRecipients}'" > ${lastCriticalErrorSent}
+    else
+        logDebug "lastCriticalErrorTimestampFile already exists with age ${timeSinceLastCriticalErrorSentMinutes} minutes, writing criticalErrorsLogFile to it but not sending any messages yet, to avoid sending errors more than once per ${gapBetweenCriticalErrorMessagesMinutes} minutes"
+        
+        # Append most recent error to criticalErrorsLogFile
+        echo -e "${temporaryErrorFileContents}\n" >> ${criticalErrorsLogFile}
+    fi
+
+    logDebug "lastCriticalErrorTimestampFile checked or touched, exiting with error exit code; cleanupTemporaryFiles should now delete this instance lock file"
+    
+    # Exit with error code to represent an error occurring; lock file is still cleaned up to allow this script to continually re-try
+    exit 1
+}
+
+# Filter out unwanted debug on STDERR
+function cleanErrorFile
+{
+    if [ -s "$temporaryErrorFile" ]
+    then
+        tmpErrorFile="$temporaryErrorFile.tmp"
+        cp "$temporaryErrorFile" "$tmpErrorFile"
+        # Edit this #
+        grep -v "^.* row.s. unloaded.$" "$tmpErrorFile" | \
+            grep -v "^$" \
+            > "$temporaryErrorFile"
+        rm "$tmpErrorFile"
+    fi
+}
+
+# Move to directory which this script should run from (this directory should contain a 'logs' directory
+cd ${absolutePathToRunFrom}
+
+# Create a lock directory, failing with an error if it already exists, to avoid multiple instances of this script running at once.
+# The best way to achieve this locking whilst avoiding race conditions has been discussed several times with Steve Shanks and Claudio Calvelli, and has had lots of my own research.
+# I've concluded this solution is best as mkdir is atomic, portable, and it allows me to store the PID of the running script for debugging in case something goes wrong.
+# There are some decent examples and discussion in the BashFAQ: http://mywiki.wooledge.org/BashFAQ/045
+if mkdir "${thisWrapperScriptLockDirectory}" 2>/dev/null
+then
+    logDebug "Successfully acquired lock using directory ${thisWrapperScriptLockDirectory}"
+    
+    # No lock file exists for this scriptUniqueAlphanumericName, create one for this wrapper script PID and proceed with execution of script
+    touch ${thisWrapperScriptInstanceLockFile}
+
+    # Lock file didn't exist; do the work (redirecting stdout and stderr to debug/error logs)
+    logDebug "Running command ${commandToRun} from directory ${absolutePathToRunFrom} in background"
+    
+    ${commandToRun} 1>>"$debugLogFile" 2>>"$temporaryErrorFile" &
+    backgroundScriptPID=$!
+    
+    logDebug "Script with PID: ${backgroundScriptPID} running, waiting for completion"
+    
+    # Wait for all child processes to complete
+    wait
+    
+    logDebug "Script with PID: ${backgroundScriptPID} execution completed"
+else
+    logDebug "Lock directory already exists at path ${thisWrapperScriptLockDirectory}"
+    
+    # Attempt to read the lock file name from the lock directory. Shell option "nullglob" stops the glob (*) from returning the empty directory if there are no files.
+    shopt -s nullglob; identifiedInstanceLockFile=(${thisWrapperScriptLockDirectory}/*.lock)
+    
+    # If instance lock file found in lock directory (which should always be the case), log it to help with debugging as it contains the PID
+    if [ -e "${identifiedInstanceLockFile[0]}" ]
+    then
+        logDebug "Running script instance lock file found in directory: $(basename ${identifiedInstanceLockFile[0]})"
+    else
+        logDebug "Instance lock file not found! Perhaps we've encountered the very small gap between the previous run deleting lock file and deleting lock directory?"
+    fi
+    
+    # Get CURRENT date/time for use when identifying lockDirectoryAge, rather than reusing the wrapperScriptStart variables defined at the top of script
+    nowUnixtime=`date "+%s"`
+    
+    # If lock directory older than max age, this is a critical error and should be reported as such
+    lockDirectoryAgeSeconds=$(( ${nowUnixtime} - `stat -c "%Y" ${thisWrapperScriptLockDirectory}` ))
+    lockDirectoryAgeMinutes=$(( ${lockDirectoryAgeSeconds} / 60 ))
+    
+    logDebug "Lock directory at path ${thisWrapperScriptLockDirectory} has age: ${lockDirectoryAgeMinutes} minute(s)"
+    
+    if [ ${lockDirectoryAgeMinutes} -gt ${maxScriptRunTimeMinutes} ]
+    then
+        logDebug "Lock directory older than ${maxScriptRunTimeMinutes} minutes, reporting and exiting"
+        
+        echo -e "Lock file age: ${lockDirectoryAgeMinutes} minutes. \nThis is older than the configured maximum of ${maxScriptRunTimeMinutes} minutes, which probably means this integration is stuck." >>"$temporaryErrorFile"
+        
+        # Calling reportCriticalErrorAndExit to send email/SMS notifications, clean up any tmp files, and exit gracefully.
+        reportCriticalErrorAndExit
+    fi
+    
+    logDebug "Exiting with success exit code; cleanupTemporaryFiles should now delete this instance lock file and lock directory"
+    
+    # Exit with success exit code to represent a successful wait
+    exit 0
+fi
+
+# Remove unwanted debug from STDERR
+cleanErrorFile 1>>"$debugLogFile" 2>>"$temporaryErrorFile"
+
+# If any errors were written to stdout, consider this a critical failure and email/send SMS text to technical contacts
+if [ -s "$temporaryErrorFile" ]
+then
+    logDebug "Error file contains content from STDERR, reporting and exiting"
+    
+    # Calling reportCriticalErrorAndExit to send email/SMS notifications, clean up any tmp files, and exit gracefully.
+    reportCriticalErrorAndExit
+fi
+
+logDebug "Run script with locking completed successfully, exiting with success exit code; cleanupTemporaryFiles should now delete this instance lock file"
+
+# Exit with success exit code to represent a successful run
+exit 0
